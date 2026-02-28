@@ -235,14 +235,15 @@ async def set_auto_delete_config(config_type, value):
 async def get_force_channels():
     return load_json("force_channels")
 
-async def add_force_channel(chat_id, title, invite, is_permanent=False):
+async def add_force_channel(chat_id, title, invite, channel_type="normal", added_by="owner"):
     channels = load_json("force_channels")
     channels.append({
         "id": len(channels) + 1,
         "chat_id": chat_id,
         "title": title,
         "invite": invite,
-        "is_permanent": is_permanent  # Permanent channels cannot be deleted from clones
+        "type": channel_type,  # "permanent" or "normal"
+        "added_by": added_by
     })
     save_json("force_channels", channels)
 
@@ -250,6 +251,14 @@ async def delete_force_channel(cid):
     channels = load_json("force_channels")
     channels = [c for c in channels if c["id"] != int(cid)]
     save_json("force_channels", channels)
+
+async def get_permanent_force_channels():
+    channels = load_json("force_channels")
+    return [ch for ch in channels if ch.get("type") == "permanent"]
+
+async def get_normal_force_channels():
+    channels = load_json("force_channels")
+    return [ch for ch in channels if ch.get("type") == "normal"]
 
 # ==================== Custom Texts ====================
 async def get_custom_text(key):
@@ -466,52 +475,64 @@ async def process_user_request(user_id: int):
 async def is_maintenance():
     return await get_setting("maint") == "on"
 
-async def check_force_join(user_id, is_clone=False):
-    channels = await get_force_channels()
-    if not channels:
+async def check_force_join(user_id, is_clone=False, clone_token=None):
+    if is_clone:
+        # For clone bots: check permanent channels from main bot + clone's own channels
+        permanent_channels = await get_permanent_force_channels()
+        
+        # Get clone's own force channels if any
+        clone_channels = []
+        if clone_token:
+            clone_channels = await get_clone_force_channels(clone_token)
+        
+        all_channels = permanent_channels + clone_channels
+    else:
+        # For main bot: check all channels
+        all_channels = await get_force_channels()
+    
+    if not all_channels:
         return True
 
-    for ch in channels:
-        # For clones, always include permanent channels
-        if is_clone and ch.get("is_permanent"):
-            try:
-                m = await bot.get_chat_member(ch["chat_id"], user_id)
-                if m.status in ("left", "kicked"):
-                    return False
-            except:
+    for ch in all_channels:
+        try:
+            m = await bot.get_chat_member(ch["chat_id"], user_id)
+            if m.status in ("left", "kicked"):
                 return False
-        # For main bot, check all channels
-        elif not is_clone:
-            try:
-                m = await bot.get_chat_member(ch["chat_id"], user_id)
-                if m.status in ("left", "kicked"):
-                    return False
-            except:
-                return False
-    
+        except:
+            return False
     return True
 
-async def send_force_join(msg, is_clone=False):
-    channels = await get_force_channels()
+async def send_force_join(msg, is_clone=False, clone_token=None):
+    if is_clone:
+        permanent_channels = await get_permanent_force_channels()
+        clone_channels = await get_clone_force_channels(clone_token) if clone_token else []
+        channels = permanent_channels + clone_channels
+        callback_data = "clone_force_done"
+        
+        # Show which channels are permanent vs clone's own
+        channel_text = "\n".join([
+            f"🔒 {ch['title']} (Main Owner)" if ch.get("type") == "permanent" 
+            else f"📌 {ch['title']} (Your Channel)" 
+            for ch in channels
+        ])
+    else:
+        channels = await get_force_channels()
+        callback_data = "force_done"
+        channel_text = "\n".join([f"• {ch['title']}" for ch in channels])
+
     if not channels:
         return True
-
-    # Filter channels for clone (only permanent ones)
-    if is_clone:
-        channels = [ch for ch in channels if ch.get("is_permanent")]
 
     kb = InlineKeyboardMarkup()
     for ch in channels:
         kb.add(InlineKeyboardButton(ch["title"], url=ch["invite"]))
-    
-    if is_clone:
-        kb.add(InlineKeyboardButton("✅ Done ✅", callback_data="clone_force_done"))
-    else:
-        kb.add(InlineKeyboardButton("✅ Done ✅", callback_data="force_done"))
+    kb.add(InlineKeyboardButton("✅ Done ✅", callback_data=callback_data))
 
     force_text = await get_custom_text("forcemsg")
+    base_text = force_text.get("text") or "⚠️ **BOTအသုံးပြုခွင့် ကန့်သတ်ထားပါသည်။**\n\nအောက်ပါ Channel များကို Join လုပ်ပေးပါ:\n\n{channels}"
+    
     formatted_text = parse_telegram_format(
-        force_text.get("text") or "⚠️ **BOTအသုံးပြုခွင့် ကန့်သတ်ထားပါသည်။**\n\nBOT ကိုအသုံးပြု နိုင်ရန်အတွက်အောက်ပါ Channel များကို အရင် Join ပေးထားရပါမည်။",
+        base_text.replace("{channels}", channel_text),
         msg.from_user.full_name,
         msg.from_user.get_mention(as_html=True)
     )
@@ -612,6 +633,9 @@ async def send_start_welcome(msg: types.Message, is_owner: bool):
         if buttons:
             kb.row(*buttons)
 
+    # Add Make Your Own Bot button for all users
+    kb.add(InlineKeyboardButton("🤖 Make Your Own Bot", callback_data="make_own_bot"))
+
     if is_owner:
         kb.add(InlineKeyboardButton("⚙️ Manage Start Buttons", callback_data="manage_start_buttons"))
 
@@ -642,6 +666,147 @@ async def send_start_welcome(msg: types.Message, is_owner: bool):
             reply_markup=kb,
             protect_content=True
         )
+
+# ==================== Make Your Own Bot ====================
+class MakeBotStates(StatesGroup):
+    waiting_token = State()
+    confirm_clone = State()
+
+@dp.callback_query_handler(lambda c: c.data == "make_own_bot")
+async def make_own_bot_start(call: types.CallbackQuery):
+    await call.message.answer(
+        "🤖 **Make Your Own Bot**\n\n"
+        "သင့်ကိုယ်ပိုင် Bot တစ်ခု ဖန်တီးရန်:\n\n"
+        "1. @BotFather ဆီသွားပါ\n"
+        "2. /newbot ဆိုပြီး Bot အသစ်လုပ်ပါ\n"
+        "3. ရလာတဲ့ Token ကို ဒီမှာပို့ပါ\n\n"
+        "Token Format: 1234567890:ABCdefGHIjklMNOpqrsTUVwxyz\n\n"
+        "မလုပ်တော့ပါက /cancel ရိုက်ပါ။",
+        protect_content=True
+    )
+    await MakeBotStates.waiting_token.set()
+    await call.answer()
+
+@dp.message_handler(state=MakeBotStates.waiting_token)
+async def make_bot_token(msg: types.Message, state: FSMContext):
+    if msg.text == "/cancel":
+        await msg.answer("❌ Cancelled", protect_content=True)
+        await state.finish()
+        return
+    
+    token = msg.text.strip()
+    
+    if not re.match(r'^\d+:[A-Za-z0-9_-]+$', token):
+        await msg.answer("❌ Token Format မမှန်ပါ။", protect_content=True)
+        return
+    
+    # Test token
+    try:
+        test_bot = Bot(token=token)
+        me = await test_bot.get_me()
+        await test_bot.session.close()
+    except Exception as e:
+        await msg.answer(f"❌ Token မမှန်ပါ။ Error: {str(e)}", protect_content=True)
+        return
+    
+    await state.update_data(
+        token=token,
+        bot_username=me.username,
+        bot_name=me.first_name,
+        user_id=msg.from_user.id,
+        user_name=msg.from_user.full_name,
+        user_mention=msg.from_user.get_mention(as_html=True)
+    )
+    
+    # Send to main owner for confirmation
+    kb = InlineKeyboardMarkup()
+    kb.add(
+        InlineKeyboardButton("✅ Confirm", callback_data="confirm_clone_yes"),
+        InlineKeyboardButton("❌ Cancel", callback_data="confirm_clone_no")
+    )
+    
+    owner_text = (
+        f"🤖 **New Clone Bot Request**\n\n"
+        f"👤 **Requester:** {msg.from_user.get_mention(as_html=True)}\n"
+        f"🆔 **User ID:** {msg.from_user.id}\n\n"
+        f"🤖 **Bot Info:**\n"
+        f"• Username: @{me.username}\n"
+        f"• Name: {me.first_name}\n"
+        f"• Token: {token[:15]}...\n\n"
+        f"Clone လုပ်ရန် Confirm လုပ်ပါ။"
+    )
+    
+    await bot.send_message(OWNER_ID, owner_text, reply_markup=kb, protect_content=True)
+    await msg.answer("✅ Owner ဆီသို့ ခွင့်ပြုချက်တောင်းခံထားပါသည်။ ခဏစောင့်ပါ။", protect_content=True)
+    
+    await MakeBotStates.confirm_clone.set()
+
+@dp.callback_query_handler(lambda c: c.data.startswith("confirm_clone_"), state=MakeBotStates.confirm_clone)
+async def confirm_clone(call: types.CallbackQuery, state: FSMContext):
+    if call.from_user.id != OWNER_ID:
+        await call.answer("သင်သည် Owner မဟုတ်ပါ။", show_alert=True)
+        return
+    
+    data = await state.get_data()
+    token = data.get("token")
+    bot_username = data.get("bot_username")
+    bot_name = data.get("bot_name")
+    user_id = data.get("user_id")
+    user_name = data.get("user_name")
+    user_mention = data.get("user_mention")
+    
+    if call.data == "confirm_clone_yes":
+        # Add to database
+        bot_info = await add_clone_bot(
+            token=token,
+            bot_username=bot_username,
+            bot_name=bot_name,
+            owner_id=user_id,
+            owner_name=user_name,
+            owner_mention=user_mention
+        )
+        
+        if bot_info:
+            # Start the bot
+            await clone_manager.start_bot(bot_info)
+            
+            # Notify requester
+            try:
+                await bot.send_message(
+                    user_id,
+                    f"✅ **Clone Bot အတည်ပြုပြီးပါပြီ!**\n\n"
+                    f"🤖 Bot: @{bot_username}\n"
+                    f"📅 Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                    f"သင်၏ Clone Bot ကို စတင်အသုံးပြုနိုင်ပါပြီ။\n"
+                    f"@{bot_username} ကို သွားပြီး /start နှိပ်ပါ။",
+                    protect_content=True
+                )
+            except:
+                pass
+            
+            await call.message.edit_text(
+                f"✅ **Clone Bot Created Successfully!**\n\n"
+                f"🤖 Bot: @{bot_username}\n"
+                f"👤 Owner: {user_name}\n"
+                f"📅 Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+            await call.answer("✅ Bot started!", show_alert=True)
+        else:
+            await call.message.edit_text("❌ Failed to create clone bot.")
+    else:
+        # Notify requester
+        try:
+            await bot.send_message(
+                user_id,
+                f"❌ **Clone Bot Request ကို ပယ်ဖျက်လိုက်ပါသည်။**",
+                protect_content=True
+            )
+        except:
+            pass
+        
+        await call.message.edit_text("❌ Clone Bot creation cancelled.")
+    
+    await state.finish()
 
 # ==================== Start Button Management ====================
 class StartButtonManagement(StatesGroup):
@@ -1006,13 +1171,19 @@ async def statistics_panel(msg: types.Message):
     daily_active = await get_daily_active_users()
     top_users = await get_top_searches(5)
     total_movies = len(MOVIES_DICT)
+    clone_bots = await get_clone_bots()
 
     text = "📊 **Bot Statistics**\n\n"
     text += f"👥 Total Users: **{total_users}**\n"
     text += f"🟢 Daily Active: **{daily_active}**\n"
-    text += f"🎬 Total Movies: **{total_movies}**\n\n"
+    text += f"🎬 Total Movies: **{total_movies}**\n"
+    text += f"🤖 Clone Bots: **{len(clone_bots)}**\n\n"
 
-    text += "🔝 **Top 5 Searchers:**\n"
+    if clone_bots:
+        total_clone_users = sum(b.get("total_users", 0) for b in clone_bots)
+        text += f"👥 Clone Users: **{total_clone_users}**\n"
+
+    text += "\n🔝 **Top 5 Searchers:**\n"
     for i, user in enumerate(top_users, 1):
         name = user.get("name", "Unknown")
         count = user.get("search_count", 0)
@@ -1118,6 +1289,12 @@ async def process_clear_all_data(call: types.CallbackQuery):
     save_json("auto_delete", [])
     save_json("start_buttons", [])
     save_json("start_welcome", [])
+    save_json("clone_bots", [])
+
+    # Also clear all clone data files
+    for filename in os.listdir(DATA_DIR):
+        if filename.startswith("clone_"):
+            os.remove(os.path.join(DATA_DIR, filename))
 
     await reload_movies_cache()
 
@@ -1131,48 +1308,67 @@ async def force(call: types.CallbackQuery):
         return
 
     channels = await get_force_channels()
-    text = "📡 Force Channels:\n\n"
-
-    if not channels:
-        text += "No force channels added yet."
+    permanent = [ch for ch in channels if ch.get("type") == "permanent"]
+    normal = [ch for ch in channels if ch.get("type") == "normal"]
+    
+    text = "📡 **Force Channels Management**\n\n"
+    
+    text += "🔒 **Permanent Channels (Auto in all clones, cannot be deleted from clones):**\n"
+    if permanent:
+        for ch in permanent:
+            text += f"   • {ch['id']}. {ch['title']}\n"
     else:
-        for ch in channels:
-            perm = "🔒 Permanent" if ch.get("is_permanent") else "📌 Normal"
-            text += f"{ch['id']}. {ch['title']} ({perm})\n"
+        text += "   No permanent channels\n"
+    
+    text += "\n📌 **Normal Channels (Main bot only):**\n"
+    if normal:
+        for ch in normal:
+            text += f"   • {ch['id']}. {ch['title']}\n"
+    else:
+        text += "   No normal channels\n"
 
-    kb = InlineKeyboardMarkup(row_width=1)
-
-    for ch in channels:
-        kb.add(InlineKeyboardButton(f"❌ {ch['title']}", callback_data=f"delch_{ch['id']}"))
-
-    kb.add(InlineKeyboardButton("➕ Add Channel", callback_data="add_force"))
-    kb.add(InlineKeyboardButton("⭐ Add Permanent Channel", callback_data="add_permanent_force"))
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("➕ Add Normal", callback_data="add_force_normal"),
+        InlineKeyboardButton("🔒 Add Permanent", callback_data="add_force_permanent")
+    )
+    
+    if channels:
+        kb.add(InlineKeyboardButton("🗑 Delete Channel", callback_data="delete_force_channel"))
+    
     kb.add(InlineKeyboardButton("⬅ Back", callback_data="back_admin"))
 
     await call.message.edit_text(text, reply_markup=kb)
 
-@dp.callback_query_handler(lambda c: c.data == "add_force")
-async def add_force(call: types.CallbackQuery):
+@dp.callback_query_handler(lambda c: c.data == "add_force_normal")
+async def add_force_normal(call: types.CallbackQuery):
     if call.from_user.id != OWNER_ID:
         return
-
+    
+    await dp.current_state().update_data(force_channel_type="normal")
     await call.message.answer(
-        "📌 Channel link ပေးပါ (public/private OK)\n\n"
-        "Example:\nhttps://t.me/yourchannel\nhttps://t.me/+AbCdEfGhIjKlMn==",
-        protect_content=True
-    )
-
-@dp.callback_query_handler(lambda c: c.data == "add_permanent_force")
-async def add_permanent_force(call: types.CallbackQuery):
-    if call.from_user.id != OWNER_ID:
-        return
-
-    await call.message.answer(
-        "🔒 **Permanent Channel ထည့်ရန်**\n\n"
-        "ဒီ Channel ကို Clone Bot တွေမှာ ဖျက်လို့မရပါ။\n\n"
+        "📌 **Normal Channel ထည့်ရန်**\n\n"
+        "ဒီ Channel ကို Main Bot မှာပဲ Force Join လုပ်မှာဖြစ်ပြီး\n"
+        "Clone Bot တွေမှာ မပါဝင်ပါ။\n\n"
         "Channel link ပေးပါ:",
         protect_content=True
     )
+    await call.answer()
+
+@dp.callback_query_handler(lambda c: c.data == "add_force_permanent")
+async def add_force_permanent(call: types.CallbackQuery):
+    if call.from_user.id != OWNER_ID:
+        return
+    
+    await dp.current_state().update_data(force_channel_type="permanent")
+    await call.message.answer(
+        "🔒 **Permanent Channel ထည့်ရန်**\n\n"
+        "ဒီ Channel ကို Main Bot နဲ့ Clone Bot အားလုံးမှာ\n"
+        "Force Join လုပ်မှာဖြစ်ပြီး Clone Bot တွေမှာ ဖျက်လို့မရပါ။\n\n"
+        "Channel link ပေးပါ:",
+        protect_content=True
+    )
+    await call.answer()
 
 @dp.message_handler(lambda m: m.text and m.text.startswith("https://t.me/"))
 async def catch_force_link(msg: types.Message):
@@ -1180,76 +1376,94 @@ async def catch_force_link(msg: types.Message):
         return
 
     link = msg.text.strip()
-    chat_id = None
-    chat = None
-    is_permanent = False
-
-    # Check if previous message was asking for permanent channel
-    context = await dp.current_state().get_data()
-    if context.get("adding_permanent"):
-        is_permanent = True
-        await dp.current_state().reset_state()
-
-    if "+" not in link:
-        username = link.split("t.me/")[1].replace("@", "").strip("/")
-        try:
+    
+    # Get channel type from context
+    state = dp.current_state()
+    context = await state.get_data()
+    channel_type = context.get("force_channel_type", "normal")
+    
+    try:
+        if "+" not in link:
+            username = link.split("t.me/")[1].replace("@", "").strip("/")
             chat = await bot.get_chat(f"@{username}")
             chat_id = chat.id
-        except:
-            return await msg.answer("❌ Public channel not found", protect_content=True)
-    else:
-        try:
+        else:
             chat = await bot.get_chat(link)
             chat_id = chat.id
-        except:
-            return await msg.answer("❌ Private channel invalid", protect_content=True)
-
-    try:
+        
+        # Check bot is admin
         bot_member = await bot.get_chat_member(chat_id, (await bot.get_me()).id)
         if bot_member.status not in ("administrator", "creator"):
             return await msg.answer("❌ Bot must be admin in channel", protect_content=True)
-    except:
-        return await msg.answer("❌ Cannot check admin status", protect_content=True)
+        
+        # Get invite link
+        try:
+            invite = await bot.export_chat_invite_link(chat_id)
+        except:
+            if chat.username:
+                invite = f"https://t.me/{chat.username}"
+            else:
+                return await msg.answer("❌ Cannot create invite link", protect_content=True)
+        
+        # Add channel
+        await add_force_channel(chat_id, chat.title, invite, channel_type)
+        
+        type_text = "🔒 Permanent" if channel_type == "permanent" else "📌 Normal"
+        await msg.answer(f"✅ Added: {chat.title} ({type_text})", protect_content=True)
+        
+    except Exception as e:
+        await msg.answer(f"❌ Error: {str(e)}", protect_content=True)
+    
+    finally:
+        await state.reset_state()
 
-    try:
-        invite = await bot.export_chat_invite_link(chat_id)
-    except:
-        if chat.username:
-            invite = f"https://t.me/{chat.username}"
-        else:
-            return await msg.answer("❌ Cannot create invite link", protect_content=True)
-
-    await add_force_channel(chat_id, chat.title, invite, is_permanent)
-
-    perm_text = "🔒 Permanent" if is_permanent else "📌 Normal"
-    await msg.answer(f"✅ Added: {chat.title} ({perm_text})", protect_content=True)
-
-@dp.callback_query_handler(lambda c: c.data.startswith("delch_"))
-async def delch(call: types.CallbackQuery):
+@dp.callback_query_handler(lambda c: c.data == "delete_force_channel")
+async def delete_force_channel_list(call: types.CallbackQuery):
     if call.from_user.id != OWNER_ID:
         return
+    
+    channels = await get_force_channels()
+    
+    if not channels:
+        await call.answer("❌ No channels to delete", show_alert=True)
+        return
+    
+    kb = InlineKeyboardMarkup(row_width=1)
+    for ch in channels:
+        ch_type = "🔒" if ch.get("type") == "permanent" else "📌"
+        kb.add(InlineKeyboardButton(
+            f"{ch_type} {ch['title']}",
+            callback_data=f"del_force_{ch['id']}"
+        ))
+    
+    kb.add(InlineKeyboardButton("⬅ Back", callback_data="force"))
+    
+    await call.message.edit_text("Select channel to delete:", reply_markup=kb)
 
-    cid = call.data.split("_")[1]
+@dp.callback_query_handler(lambda c: c.data.startswith("del_force_"))
+async def delete_force_channel_confirm(call: types.CallbackQuery):
+    if call.from_user.id != OWNER_ID:
+        return
+    
+    cid = int(call.data.replace("del_force_", ""))
     await delete_force_channel(cid)
     await call.answer("✅ Deleted", show_alert=True)
-
     await force(call)
 
 # ==================== Force Done ====================
 @dp.callback_query_handler(lambda c: c.data == "force_done")
 async def force_done(call: types.CallbackQuery):
-    ok = await check_force_join(call.from_user.id)
+    ok = await check_force_join(call.from_user.id, is_clone=False)
 
     if not ok:
         await call.answer(
             "❌ Channel အားလုံးကို Join မလုပ်ရသေးပါ။\n"
-            "ကျေးဇူးပြု၍ သတ်မှတ်ထားသော Channel များအားလုံးကို အရင် Join လုပ်ပါ။\n"
-            "ပြီးရင် 'Done' ကို နှိပ်ပါ။",
+            "ကျေးဇူးပြု၍ သတ်မှတ်ထားသော Channel များအားလုံးကို အရင် Join လုပ်ပါ။",
             show_alert=True
         )
         return
 
-    await call.answer("joinပေးတဲ့အတွက်ကျေးဇူးတင်ပါတယ်!", show_alert=True)
+    await call.answer("✅ Join ပေးတဲ့အတွက်ကျေးဇူးတင်ပါတယ်!", show_alert=True)
     await call.message.delete()
     await send_start_welcome(call.message, call.from_user.id == OWNER_ID)
 
@@ -1335,10 +1549,10 @@ async def edit_text_done(msg: types.Message, state: FSMContext):
     await state.finish()
 
 # ==================== Movie List ====================
-@dp.message_handler(lambda m: m.text == " Movie CodeList")
+@dp.message_handler(lambda m: m.text == "📋 Movie List")
 async def movie_list_redirect(msg: types.Message):
     kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton(" Movie Code များကြည့်ရန်", url="https://t.me/Movie462"))
+    kb.add(InlineKeyboardButton("📋 Movie Code များကြည့်ရန်", url="https://t.me/Movie462"))
     await msg.answer("Code များကြည့်ရန် အောက်ပါ Button ကိုနှိပ်ပါ", reply_markup=kb, protect_content=True)
 
 # ==================== Maintenance ====================
@@ -1464,8 +1678,8 @@ async def bc_content(msg: types.Message, state: FSMContext):
         return await msg.answer("❌ Unsupported content type", protect_content=True)
 
     kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("✅ ပြန်ဖြစ်ရင်ပဲပို့မယ်", callback_data="bc_no_buttons"))
-    kb.add(InlineKeyboardButton("➕ Buttons ထည့်မယ်", callback_data="bc_add_buttons"))
+    kb.add(InlineKeyboardButton("✅ No Buttons", callback_data="bc_no_buttons"))
+    kb.add(InlineKeyboardButton("➕ Add Buttons", callback_data="bc_add_buttons"))
 
     await msg.answer("Buttons ထည့်မလား?", reply_markup=kb, protect_content=True)
 
@@ -1517,7 +1731,7 @@ async def bc_buttons_collect(msg: types.Message, state: FSMContext):
     buttons.append({"name": name, "url": url})
     await state.update_data(buttons=buttons)
 
-    await msg.answer(f"✅ Button '{name}' ထည့်ပြီး။\nထပ်ထည့်မယ်ဆိုရင် ဆက်ပို့ပါ။\nပြီးရင် /done ရိုက်ပါ။", protect_content=True)
+    await msg.answer(f"✅ Button '{name}' added. Send more or /done", protect_content=True)
 
 async def confirm_broadcast(call: types.CallbackQuery, state: FSMContext):
     await Broadcast.confirm.set()
@@ -1588,7 +1802,7 @@ async def bc_confirm(call: types.CallbackQuery, state: FSMContext):
             except:
                 pass
 
-    # Send to clone bot users (with rate limiting: 20 users/sec)
+    # Send to clone bot users (rate limit: 20 per second)
     for i, user in enumerate(all_clone_users):
         try:
             if data["content_type"] == "text":
@@ -1603,7 +1817,6 @@ async def bc_confirm(call: types.CallbackQuery, state: FSMContext):
         except:
             clone_failed += 1
 
-        # Rate limit: 20 users per second
         if (i + 1) % 20 == 0:
             await asyncio.sleep(1)
 
@@ -1634,7 +1847,7 @@ async def os_command(msg: types.Message):
     group_sec = next((c["seconds"] for c in config if c["type"] == "group"), 0)
 
     response = await msg.reply(
-        "**owner-@osamu1123**\n\n"
+        "**Owner: @osamu1123**\n\n"
         "• Bot Status: ✅ Online\n"
         "• Queue System: 🟢 Active (Batch: 30)\n"
         "• Auto-Delete: " + ("✅ " + str(group_sec) + "s" if group_sec > 0 else "❌ Disabled") + "\n"
@@ -1652,7 +1865,7 @@ async def os_command(msg: types.Message):
 async def search(msg: types.Message):
     if msg.text == "🔍 Search Movie":
         kb = InlineKeyboardMarkup()
-        kb.add(InlineKeyboardButton("Movie Code များကြည့်ရန်", url="https://t.me/Movie462"))
+        kb.add(InlineKeyboardButton("📋 Movie Code များကြည့်ရန်", url="https://t.me/Movie462"))
         return await msg.answer("🔍 <b>ဇာတ်ကား Code ပို့ပေးပါ</b>", reply_markup=kb, protect_content=True)
 
     if msg.text.startswith("/"):
@@ -1661,10 +1874,9 @@ async def search(msg: types.Message):
     if await is_maintenance() and msg.from_user.id != OWNER_ID:
         return await msg.answer("🛠 Bot ပြုပြင်နေပါသဖြင့် ခေတ္တပိတ်ထားပါသည်။", protect_content=True)
 
-    if not await check_force_join(msg.from_user.id):
-        sent = await send_force_join(msg)
-        if sent is False:
-            return
+    if not await check_force_join(msg.from_user.id, is_clone=False):
+        await send_force_join(msg, is_clone=False)
+        return
 
     if msg.from_user.id != OWNER_ID:
         last = await get_user_last(msg.from_user.id)
@@ -1755,7 +1967,6 @@ async def backup_db(call: types.CallbackQuery):
     if call.from_user.id != OWNER_ID:
         return
 
-    # Collect main bot data
     data = {
         "movies": await get_movies(),
         "users": await get_users(),
@@ -1769,20 +1980,17 @@ async def backup_db(call: types.CallbackQuery):
         "clone_bots": await get_clone_bots()
     }
     
-    # Collect all clone bots data
+    # Collect clone bots data
     clone_bots = await get_clone_bots()
     clone_data = {}
-    
     for bot in clone_bots:
         token = bot["token"]
         clone_data[token] = {
             "users": load_json(f"clone_users_{token.replace(':', '_')}"),
-            "info": bot
+            "force_channels": load_json(f"clone_force_{token.replace(':', '_')}") if os.path.exists(f"{DATA_DIR}/clone_force_{token.replace(':', '_')}.json") else []
         }
-    
     data["clone_bots_data"] = clone_data
 
-    # Save backup file
     backup_file = f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     with open(backup_file, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=4, ensure_ascii=False)
@@ -1795,7 +2003,7 @@ async def backup_db(call: types.CallbackQuery):
     )
     
     os.remove(backup_file)
-    await call.answer("Backup sent!", show_alert=True)
+    await call.answer("✅ Backup sent!", show_alert=True)
 
 # ==================== Restore ====================
 @dp.callback_query_handler(lambda c: c.data == "restore")
@@ -1816,7 +2024,7 @@ async def restore_process(msg: types.Message):
         with open("restore.json", "r", encoding="utf-8") as f:
             data = json.load(f)
 
-        # Restore main bot data
+        # Restore main data
         if data.get("movies"):
             save_json("movies", data["movies"])
         if data.get("users"):
@@ -1843,12 +2051,14 @@ async def restore_process(msg: types.Message):
             for token, bot_data in data["clone_bots_data"].items():
                 if bot_data.get("users"):
                     save_json(f"clone_users_{token.replace(':', '_')}", bot_data["users"])
+                if bot_data.get("force_channels"):
+                    save_json(f"clone_force_{token.replace(':', '_')}", bot_data["force_channels"])
 
         await reload_movies_cache()
         await msg.answer("✅ Restore Completed! Restarting clone bots...", protect_content=True)
         
         # Restart clone bots
-        await load_clone_bots_on_startup()
+        await clone_manager.load_all_bots()
         
     except Exception as e:
         await msg.answer(f"❌ Restore Failed: {str(e)}", protect_content=True)
@@ -1892,8 +2102,10 @@ async def add_clone_bot(token, bot_username, bot_name, owner_id, owner_name, own
     bots.append(new_bot)
     save_json("clone_bots", bots)
     
-    # Create user database for this clone
+    # Create separate databases for this clone bot
     save_json(f"clone_users_{token.replace(':', '_')}", [])
+    save_json(f"clone_force_{token.replace(':', '_')}", [])  # Clone's own force channels
+    save_json(f"clone_settings_{token.replace(':', '_')}", load_json("settings"))
     
     return new_bot
 
@@ -1908,7 +2120,7 @@ async def update_clone_bot(token, **kwargs):
     save_json("clone_bots", bots)
 
 async def delete_clone_bot(token):
-    # Stop the bot first
+    # Stop if running
     if token in clone_manager.clone_bots:
         await clone_manager.clone_bots[token].stop()
         del clone_manager.clone_bots[token]
@@ -1918,10 +2130,10 @@ async def delete_clone_bot(token):
     bots = [b for b in bots if b["token"] != token]
     save_json("clone_bots", bots)
     
-    # Delete user data
-    user_file = f"{DATA_DIR}/clone_users_{token.replace(':', '_')}.json"
-    if os.path.exists(user_file):
-        os.remove(user_file)
+    # Delete all clone data files
+    for filename in os.listdir(DATA_DIR):
+        if token.replace(':', '_') in filename:
+            os.remove(os.path.join(DATA_DIR, filename))
     
     return True
 
@@ -1934,6 +2146,29 @@ async def get_clone_bot(token):
 
 async def get_clone_bot_users(token):
     return load_json(f"clone_users_{token.replace(':', '_')}")
+
+async def get_clone_force_channels(token):
+    return load_json(f"clone_force_{token.replace(':', '_')}")
+
+async def add_clone_force_channel(token, chat_id, title, invite):
+    channels = load_json(f"clone_force_{token.replace(':', '_')}")
+    channels.append({
+        "id": len(channels) + 1,
+        "chat_id": chat_id,
+        "title": title,
+        "invite": invite,
+        "type": "normal",
+        "added_by": "clone_owner",
+        "added_date": datetime.now().isoformat()
+    })
+    save_json(f"clone_force_{token.replace(':', '_')}", channels)
+    return True
+
+async def delete_clone_force_channel(token, channel_id):
+    channels = load_json(f"clone_force_{token.replace(':', '_')}")
+    channels = [ch for ch in channels if ch["id"] != channel_id]
+    save_json(f"clone_force_{token.replace(':', '_')}", channels)
+    return True
 
 async def add_clone_bot_user(token, user_id, user_name, user_mention):
     filename = f"clone_users_{token.replace(':', '_')}"
@@ -2016,7 +2251,7 @@ class CloneBotProcess:
             asyncio.create_task(self.start_polling())
             self.running = True
             
-            print(f"✅ Clone Bot @{self.bot_info.get('bot_username')} started")
+            print(f"✅ Clone Bot @{self.bot_info.get('bot_username')} started (Owner: {self.bot_info.get('owner_name')})")
             return True
         except Exception as e:
             print(f"❌ Clone bot start error: {e}")
@@ -2047,15 +2282,21 @@ class CloneBotProcess:
             user_name = msg.from_user.full_name
             user_mention = msg.from_user.get_mention(as_html=True)
             
+            # Add user to database
             await add_clone_bot_user(self.token, user_id, user_name, user_mention)
             
-            # Force Join Check - Only permanent channels
-            channels = await get_force_channels()
-            permanent_channels = [ch for ch in channels if ch.get("is_permanent")]
+            # Check if user is the owner of this clone bot
+            is_owner = (user_id == self.bot_info.get("owner_id"))
             
-            if permanent_channels:
+            # Force Join Check - Permanent channels from main bot + clone's own channels
+            permanent_channels = await get_permanent_force_channels()
+            clone_channels = await get_clone_force_channels(self.token)
+            
+            all_channels = permanent_channels + clone_channels
+            
+            if all_channels:
                 not_joined = []
-                for ch in permanent_channels:
+                for ch in all_channels:
                     try:
                         m = await self.bot.get_chat_member(ch["chat_id"], user_id)
                         if m.status in ("left", "kicked"):
@@ -2065,23 +2306,35 @@ class CloneBotProcess:
                 
                 if not_joined:
                     kb = InlineKeyboardMarkup()
+                    channel_text = []
                     for ch in not_joined:
                         kb.add(InlineKeyboardButton(ch["title"], url=ch["invite"]))
+                        if ch.get("type") == "permanent":
+                            channel_text.append(f"🔒 {ch['title']} (Main Owner)")
+                        else:
+                            channel_text.append(f"📌 {ch['title']} (Your Channel)")
+                    
                     kb.add(InlineKeyboardButton("✅ Done ✅", callback_data="clone_force_done"))
                     
                     force_text = await get_custom_text("forcemsg")
-                    text = force_text.get("text") or "⚠️ Channel Join လုပ်ပေးပါ။"
+                    base_text = force_text.get("text") or "⚠️ **အောက်ပါ Channel များကို Join လုပ်ပေးပါ**\n\n{channels}"
                     
-                    await msg.answer(text, reply_markup=kb, protect_content=True)
+                    formatted_text = parse_telegram_format(
+                        base_text.replace("{channels}", "\n".join(channel_text)),
+                        user_name,
+                        user_mention
+                    )
+                    
+                    await msg.answer(formatted_text, reply_markup=kb, protect_content=True)
                     return
             
-            # Welcome Message with Watermark
+            # Welcome Message with PERMANENT WATERMARK
             welcome_data = await get_next_welcome_photo()
             
             # PERMANENT WATERMARK - Cannot be removed
             watermark = "\n\n━━━━━━━━━━━━━━\n<i>This Bot Made by @seatvmm using @osamu1123's source</i>"
             
-            # Create buttons
+            # Create buttons from main bot's start buttons
             kb = InlineKeyboardMarkup(row_width=2)
             rows = await get_start_buttons_by_row()
             
@@ -2096,11 +2349,15 @@ class CloneBotProcess:
                 if buttons:
                     kb.row(*buttons)
             
-            # PERMANENT OWNER BUTTON - Cannot be removed
-            kb.add(InlineKeyboardButton("👑 Bot Owner", callback_data="clone_owner_popup"))
+            # Add owner panel button for clone owner
+            if is_owner:
+                kb.add(InlineKeyboardButton("⚙️ My Bot Panel", callback_data="clone_owner_panel"))
+            
+            # PERMANENT MAIN OWNER BUTTON - Cannot be removed
+            kb.add(InlineKeyboardButton("👑 Main Owner", callback_data="clone_main_owner_popup"))
             
             welcome_text = parse_telegram_format(
-                welcome_data.get("caption") or welcome_data.get("text", "👋 Welcome!"),
+                welcome_data.get("caption") or welcome_data.get("text", "👋 Welcome to Clone Bot!"),
                 user_name,
                 user_mention
             ) + watermark
@@ -2122,24 +2379,154 @@ class CloneBotProcess:
             menu_kb = ReplyKeyboardMarkup(resize_keyboard=True)
             menu_kb.add(KeyboardButton("🔍 Search Movie"))
             menu_kb.add(KeyboardButton("📋 Movie List"))
+            
+            if is_owner:
+                menu_kb.add(KeyboardButton("⚙️ Owner Panel"))
+            
             await msg.answer("🔝 Main Menu", reply_markup=menu_kb, protect_content=True)
         
-        @self.dp.callback_query_handler(lambda c: c.data == "clone_owner_popup")
-        async def clone_owner_popup(call: types.CallbackQuery):
+        @self.dp.callback_query_handler(lambda c: c.data == "clone_main_owner_popup")
+        async def clone_main_owner_popup(call: types.CallbackQuery):
             await call.answer(
-                f"👑 Owner: @osamu1123\n"
-                f"📅 Created by: @seatvmm\n"
+                f"👑 Main Owner: @osamu1123\n"
+                f"📅 System by: @seatvmm\n"
                 f"🤖 Clone Bot System v1.0",
                 show_alert=True
             )
         
+        @self.dp.callback_query_handler(lambda c: c.data == "clone_owner_panel")
+        async def clone_owner_panel(call: types.CallbackQuery):
+            if call.from_user.id != self.bot_info.get("owner_id"):
+                await call.answer("You are not the owner of this bot!", show_alert=True)
+                return
+            
+            kb = InlineKeyboardMarkup(row_width=2)
+            kb.add(
+                InlineKeyboardButton("📊 Stats", callback_data="clone_owner_stats"),
+                InlineKeyboardButton("👥 Users", callback_data="clone_owner_users")
+            )
+            kb.add(
+                InlineKeyboardButton("➕ Add Force", callback_data="clone_add_force"),
+                InlineKeyboardButton("🗑 My Forces", callback_data="clone_list_force")
+            )
+            kb.add(
+                InlineKeyboardButton("🔙 Main Menu", callback_data="clone_back_menu")
+            )
+            
+            await call.message.answer("⚙️ **Your Bot Control Panel**", reply_markup=kb, protect_content=True)
+            await call.answer()
+        
+        @self.dp.callback_query_handler(lambda c: c.data == "clone_owner_stats")
+        async def clone_owner_stats(call: types.CallbackQuery):
+            if call.from_user.id != self.bot_info.get("owner_id"):
+                await call.answer("Not owner!", show_alert=True)
+                return
+            
+            stats = await get_clone_bot_stats(self.token)
+            if stats:
+                text = f"📊 **Your Bot Statistics**\n\n"
+                text += f"👥 **Total Users:** {stats['total_users']}\n"
+                text += f"🔍 **Total Searches:** {stats['total_searches']}\n"
+                text += f"📊 **Daily Active:** {stats['daily_active']}\n"
+                text += f"📅 **Created:** {stats['created_date'][:10]}\n"
+                
+                await call.message.answer(text, protect_content=True)
+            
+            await call.answer()
+        
+        @self.dp.callback_query_handler(lambda c: c.data == "clone_owner_users")
+        async def clone_owner_users(call: types.CallbackQuery):
+            if call.from_user.id != self.bot_info.get("owner_id"):
+                await call.answer("Not owner!", show_alert=True)
+                return
+            
+            users = await get_clone_bot_users(self.token)
+            text = f"👥 **Your Users**\n\nTotal: {len(users)}\n\n"
+            
+            for user in users[-10:]:  # Last 10 users
+                text += f"• {user.get('user_name')} - {user.get('search_count')} searches\n"
+            
+            await call.message.answer(text, protect_content=True)
+            await call.answer()
+        
+        @self.dp.callback_query_handler(lambda c: c.data == "clone_add_force")
+        async def clone_add_force_start(call: types.CallbackQuery):
+            if call.from_user.id != self.bot_info.get("owner_id"):
+                await call.answer("Not owner!", show_alert=True)
+                return
+            
+            await call.message.answer(
+                "📌 **Add Your Own Force Channel**\n\n"
+                "သင့် Bot အတွက် ကိုယ်ပိုင် Force Channel ထည့်ရန်:\n\n"
+                "Channel link ပို့ပါ (https://t.me/...)\n\n"
+                "**Note:** Main Owner ရဲ့ Permanent Channel ကတော့ ရှိနေဦးမယ်",
+                protect_content=True
+            )
+            await call.answer()
+        
+        @self.dp.callback_query_handler(lambda c: c.data == "clone_list_force")
+        async def clone_list_force(call: types.CallbackQuery):
+            if call.from_user.id != self.bot_info.get("owner_id"):
+                await call.answer("Not owner!", show_alert=True)
+                return
+            
+            permanent = await get_permanent_force_channels()
+            clone_channels = await get_clone_force_channels(self.token)
+            
+            text = "📡 **Your Force Channels**\n\n"
+            
+            text += "🔒 **Permanent (Can't Delete):**\n"
+            for ch in permanent:
+                text += f"   • {ch['title']}\n"
+            
+            text += "\n📌 **Your Channels (You can delete):**\n"
+            if clone_channels:
+                for ch in clone_channels:
+                    text += f"   • {ch['title']} (ID: {ch['id']})\n"
+            else:
+                text += "   No channels added yet\n"
+            
+            if clone_channels:
+                kb = InlineKeyboardMarkup()
+                for ch in clone_channels:
+                    kb.add(InlineKeyboardButton(
+                        f"🗑 Delete {ch['title']}",
+                        callback_data=f"clone_del_force_{ch['id']}"
+                    ))
+                kb.add(InlineKeyboardButton("🔙 Back", callback_data="clone_owner_panel"))
+                await call.message.edit_text(text, reply_markup=kb)
+            else:
+                kb = InlineKeyboardMarkup()
+                kb.add(InlineKeyboardButton("🔙 Back", callback_data="clone_owner_panel"))
+                await call.message.edit_text(text, reply_markup=kb)
+            
+            await call.answer()
+        
+        @self.dp.callback_query_handler(lambda c: c.data.startswith("clone_del_force_"))
+        async def clone_delete_force(call: types.CallbackQuery):
+            if call.from_user.id != self.bot_info.get("owner_id"):
+                await call.answer("Not owner!", show_alert=True)
+                return
+            
+            channel_id = int(call.data.replace("clone_del_force_", ""))
+            await delete_clone_force_channel(self.token, channel_id)
+            
+            await call.answer("✅ Channel deleted from your bot!", show_alert=True)
+            await clone_list_force(call)
+        
+        @self.dp.callback_query_handler(lambda c: c.data == "clone_back_menu")
+        async def clone_back_menu(call: types.CallbackQuery):
+            await call.message.delete()
+            await clone_start(call.message)
+        
         @self.dp.callback_query_handler(lambda c: c.data == "clone_force_done")
         async def clone_force_done(call: types.CallbackQuery):
-            channels = await get_force_channels()
-            permanent_channels = [ch for ch in channels if ch.get("is_permanent")]
-            ok = True
+            permanent_channels = await get_permanent_force_channels()
+            clone_channels = await get_clone_force_channels(self.token)
+            all_channels = permanent_channels + clone_channels
             
-            for ch in permanent_channels:
+            ok = True
+            for ch in all_channels:
                 try:
                     m = await self.bot.get_chat_member(ch["chat_id"], call.from_user.id)
                     if m.status in ("left", "kicked"):
@@ -2150,47 +2537,79 @@ class CloneBotProcess:
                     break
             
             if not ok:
-                await call.answer("❌ Permanent Channel များကို Join မလုပ်ရသေးပါ။", show_alert=True)
+                await call.answer("❌ Channel အားလုံးကို Join မလုပ်ရသေးပါ။", show_alert=True)
                 return
             
             await call.answer("✅ Join ပေးတဲ့အတွက်ကျေးဇူးတင်ပါတယ်!", show_alert=True)
             await call.message.delete()
-            
-            # Restart start command
             await clone_start(call.message)
         
-        @self.dp.message_handler()
+        @self.dp.message_handler(lambda m: m.text == "🔍 Search Movie")
         async def clone_search(msg: types.Message):
-            if msg.text == "🔍 Search Movie":
-                kb = InlineKeyboardMarkup()
-                kb.add(InlineKeyboardButton("Movie Code များကြည့်ရန်", url="https://t.me/Movie462"))
-                await msg.answer("🔍 <b>ဇာတ်ကား Code ပို့ပေးပါ</b>", reply_markup=kb, protect_content=True)
+            kb = InlineKeyboardMarkup()
+            kb.add(InlineKeyboardButton("📋 Movie Code များကြည့်ရန်", url="https://t.me/Movie462"))
+            await msg.answer("🔍 <b>ဇာတ်ကား Code ပို့ပေးပါ</b>", reply_markup=kb, protect_content=True)
+        
+        @self.dp.message_handler(lambda m: m.text == "📋 Movie List")
+        async def clone_movie_list(msg: types.Message):
+            kb = InlineKeyboardMarkup()
+            kb.add(InlineKeyboardButton("📋 Movie Code များကြည့်ရန်", url="https://t.me/Movie462"))
+            await msg.answer("Code များကြည့်ရန် အောက်ပါ Button ကိုနှိပ်ပါ", reply_markup=kb, protect_content=True)
+        
+        @self.dp.message_handler(lambda m: m.text == "⚙️ Owner Panel")
+        async def clone_owner_panel_menu(msg: types.Message):
+            if msg.from_user.id != self.bot_info.get("owner_id"):
                 return
             
+            kb = InlineKeyboardMarkup(row_width=2)
+            kb.add(
+                InlineKeyboardButton("📊 Stats", callback_data="clone_owner_stats"),
+                InlineKeyboardButton("👥 Users", callback_data="clone_owner_users")
+            )
+            kb.add(
+                InlineKeyboardButton("➕ Add Force", callback_data="clone_add_force"),
+                InlineKeyboardButton("🗑 My Forces", callback_data="clone_list_force")
+            )
+            
+            await msg.answer("⚙️ **Your Bot Control Panel**", reply_markup=kb, protect_content=True)
+        
+        @self.dp.message_handler()
+        async def clone_search_movie(msg: types.Message):
             if msg.text.startswith("/"):
                 return
             
-            # Force Join Check - Permanent channels only
-            channels = await get_force_channels()
-            permanent_channels = [ch for ch in channels if ch.get("is_permanent")]
+            # Force Join Check - Permanent + Clone's own channels
+            permanent_channels = await get_permanent_force_channels()
+            clone_channels = await get_clone_force_channels(self.token)
+            all_channels = permanent_channels + clone_channels
             
-            if permanent_channels:
-                for ch in permanent_channels:
+            if all_channels:
+                not_joined = []
+                for ch in all_channels:
                     try:
                         m = await self.bot.get_chat_member(ch["chat_id"], msg.from_user.id)
                         if m.status in ("left", "kicked"):
-                            kb = InlineKeyboardMarkup()
-                            for pc in permanent_channels:
-                                kb.add(InlineKeyboardButton(pc["title"], url=pc["invite"]))
-                            kb.add(InlineKeyboardButton("✅ Done ✅", callback_data="clone_force_done"))
-                            await msg.answer(
-                                "⚠️ Permanent Channel Join လုပ်ပေးပါ။",
-                                reply_markup=kb,
-                                protect_content=True
-                            )
-                            return
+                            not_joined.append(ch)
                     except:
-                        pass
+                        not_joined.append(ch)
+                
+                if not_joined:
+                    kb = InlineKeyboardMarkup()
+                    for ch in not_joined:
+                        kb.add(InlineKeyboardButton(ch["title"], url=ch["invite"]))
+                    kb.add(InlineKeyboardButton("✅ Done ✅", callback_data="clone_force_done"))
+                    
+                    force_text = await get_custom_text("forcemsg")
+                    text = force_text.get("text") or "⚠️ **Channel Join လုပ်ပေးပါ။**"
+                    
+                    formatted_text = parse_telegram_format(
+                        text,
+                        msg.from_user.full_name,
+                        msg.from_user.get_mention(as_html=True)
+                    )
+                    
+                    await msg.answer(formatted_text, reply_markup=kb, protect_content=True)
+                    return
             
             code = msg.text.strip().upper()
             movie = find_movie_by_code(code)
@@ -2199,7 +2618,7 @@ class CloneBotProcess:
                 await msg.answer(f"❌ Code `{code}` မရှိပါ။", protect_content=True)
                 return
             
-            # Send Ads (from main bot)
+            # Send ads (from main bot)
             ads = await get_ads()
             if ads:
                 idx = await get_next_ad_index()
@@ -2227,7 +2646,7 @@ class CloneBotProcess:
                     protect_content=True
                 )
                 
-                # Send watermark
+                # Send PERMANENT WATERMARK
                 await self.bot.send_message(
                     msg.from_user.id,
                     "━━━━━━━━━━━━━━\n<i>This Bot Made by @seatvmm using @osamu1123's source</i>",
@@ -2239,12 +2658,6 @@ class CloneBotProcess:
                 
             except Exception as e:
                 await msg.answer("❌ Error sending movie.", protect_content=True)
-        
-        @self.dp.message_handler(lambda m: m.text == "📋 Movie List")
-        async def clone_movie_list(msg: types.Message):
-            kb = InlineKeyboardMarkup()
-            kb.add(InlineKeyboardButton("📋 Movie Code များကြည့်ရန်", url="https://t.me/Movie462"))
-            await msg.answer("Code များကြည့်ရန် အောက်ပါ Button ကိုနှိပ်ပါ", reply_markup=kb, protect_content=True)
         
         @self.dp.message_handler(content_types=ContentType.ANY, chat_type=["group", "supergroup"])
         async def clone_group_message(msg: types.Message):
@@ -2267,9 +2680,13 @@ class CloneBotManager:
         for bot_info in bots:
             if bot_info.get("status") == "active":
                 await self.start_bot(bot_info)
+        print(f"✅ Loaded {len(self.clone_bots)} clone bots")
     
     async def start_bot(self, bot_info):
         token = bot_info["token"]
+        if token in self.clone_bots:
+            return True
+        
         bot_process = CloneBotProcess(token, bot_info)
         if await bot_process.start():
             self.clone_bots[token] = bot_process
@@ -2288,165 +2705,41 @@ class CloneBotManager:
         await self.stop_bot(token)
         await delete_clone_bot(token)
         return True
-    
-    async def get_bot_status(self, token):
-        if token in self.clone_bots:
-            return "running"
-        return "stopped"
 
 clone_manager = CloneBotManager()
 
 # ==================== Clone Bot Admin Handlers ====================
-class CloneBotStates(StatesGroup):
-    waiting_token = State()
-    confirm_clone = State()
-
 @dp.callback_query_handler(lambda c: c.data == "clone_bot_menu")
 async def clone_bot_menu(call: types.CallbackQuery):
     if call.from_user.id != OWNER_ID:
         return
     
     bots = await get_clone_bots()
-    running_count = len(clone_manager.clone_bots)
+    running = len([b for b in bots if b["token"] in clone_manager.clone_bots])
     
     text = "🤖 **Clone Bot Management**\n\n"
     text += f"📊 **Statistics:**\n"
     text += f"• Total Bots: {len(bots)}\n"
-    text += f"• Running: {running_count}\n"
-    text += f"• Stopped: {len(bots) - running_count}\n\n"
+    text += f"• Running: {running}\n"
+    text += f"• Stopped: {len(bots) - running}\n\n"
     
     if bots:
-        text += "**Bot List:**\n"
-        for bot in bots[:5]:  # Show only first 5
+        text += "**Recent Bots:**\n"
+        for bot in bots[-5:]:
             status = "✅" if bot["token"] in clone_manager.clone_bots else "❌"
             text += f"{status} @{bot['bot_username']} - {bot['total_users']} users\n"
     
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
-        InlineKeyboardButton("➕ Create Clone", callback_data="create_clone"),
-        InlineKeyboardButton("📋 All Clones", callback_data="list_clones")
+        InlineKeyboardButton("📋 All Bots", callback_data="list_clones"),
+        InlineKeyboardButton("📊 Stats", callback_data="clone_stats_all")
     )
     kb.add(
-        InlineKeyboardButton("📊 Clone Stats", callback_data="clone_stats_all"),
-        InlineKeyboardButton("🛑 Stop/Restart", callback_data="manage_clones")
+        InlineKeyboardButton("🛑 Manage", callback_data="manage_clones"),
+        InlineKeyboardButton("⬅ Back", callback_data="back_admin")
     )
-    kb.add(InlineKeyboardButton("⬅ Back", callback_data="back_admin"))
     
     await call.message.edit_text(text, reply_markup=kb)
-
-@dp.callback_query_handler(lambda c: c.data == "create_clone")
-async def create_clone_start(call: types.CallbackQuery):
-    if call.from_user.id != OWNER_ID:
-        return
-    
-    await CloneBotStates.waiting_token.set()
-    await call.message.answer(
-        "🤖 **Clone Bot ပြုလုပ်ရန်**\n\n"
-        "1. @BotFather ဆီသွားပါ\n"
-        "2. /newbot ဆိုပြီး Bot အသစ်လုပ်ပါ\n"
-        "3. ရလာတဲ့ Token ကို ဒီမှာပို့ပါ\n\n"
-        "Token Format: 1234567890:ABCdefGHIjklMNOpqrsTUVwxyz\n\n"
-        "မလုပ်တော့ပါက /cancel ရိုက်ပါ။",
-        protect_content=True
-    )
-    await call.answer()
-
-@dp.message_handler(state=CloneBotStates.waiting_token)
-async def create_clone_token(msg: types.Message, state: FSMContext):
-    if msg.text == "/cancel":
-        await msg.answer("❌ Cancelled", protect_content=True)
-        await state.finish()
-        return
-    
-    token = msg.text.strip()
-    
-    if not re.match(r'^\d+:[A-Za-z0-9_-]+$', token):
-        await msg.answer("❌ Token Format မမှန်ပါ။", protect_content=True)
-        return
-    
-    # Test token
-    try:
-        test_bot = Bot(token=token)
-        me = await test_bot.get_me()
-        await test_bot.session.close()
-    except Exception as e:
-        await msg.answer(f"❌ Token မမှန်ပါ။ Error: {str(e)}", protect_content=True)
-        return
-    
-    # Check if token exists
-    existing = await get_clone_bot(token)
-    if existing:
-        await msg.answer("❌ ဒီ Token ကို အသုံးပြုပြီးသားဖြစ်ပါသည်။", protect_content=True)
-        return
-    
-    # Save to state
-    await state.update_data(
-        token=token,
-        bot_username=me.username,
-        bot_name=me.first_name
-    )
-    
-    # Send to owner for confirmation
-    kb = InlineKeyboardMarkup()
-    kb.add(
-        InlineKeyboardButton("✅ Confirm", callback_data="confirm_clone_yes"),
-        InlineKeyboardButton("❌ Cancel", callback_data="confirm_clone_no")
-    )
-    
-    owner_text = (
-        f"🤖 **New Clone Bot Request**\n\n"
-        f"👤 **Requester:** {msg.from_user.get_mention(as_html=True)}\n"
-        f"🆔 **User ID:** {msg.from_user.id}\n\n"
-        f"🤖 **Bot Info:**\n"
-        f"• Username: @{me.username}\n"
-        f"• Name: {me.first_name}\n"
-        f"• Token: {token[:15]}...\n\n"
-        f"Clone လုပ်ရန် Confirm လုပ်ပါ။"
-    )
-    
-    await bot.send_message(OWNER_ID, owner_text, reply_markup=kb, protect_content=True)
-    await msg.answer("✅ Owner ဆီသို့ ခွင့်ပြုချက်တောင်းခံထားပါသည်။", protect_content=True)
-    
-    await CloneBotStates.confirm_clone.set()
-
-@dp.callback_query_handler(lambda c: c.data.startswith("confirm_clone_"), state=CloneBotStates.confirm_clone)
-async def confirm_clone(call: types.CallbackQuery, state: FSMContext):
-    if call.from_user.id != OWNER_ID:
-        await call.answer("You are not owner!", show_alert=True)
-        return
-    
-    data = await state.get_data()
-    token = data.get("token")
-    bot_username = data.get("bot_username")
-    bot_name = data.get("bot_name")
-    
-    if call.data == "confirm_clone_yes":
-        # Add to database
-        bot_info = await add_clone_bot(
-            token=token,
-            bot_username=bot_username,
-            bot_name=bot_name,
-            owner_id=OWNER_ID,
-            owner_name="Owner",
-            owner_mention=call.from_user.get_mention(as_html=True)
-        )
-        
-        if bot_info:
-            # Start the bot
-            await clone_manager.start_bot(bot_info)
-            
-            await call.message.edit_text(
-                f"✅ **Clone Bot Created Successfully!**\n\n"
-                f"🤖 Bot: @{bot_username}\n"
-                f"📅 Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-            )
-            await call.answer("✅ Bot started!", show_alert=True)
-        else:
-            await call.message.edit_text("❌ Failed to create clone bot.")
-    else:
-        await call.message.edit_text("❌ Clone Bot creation cancelled.")
-    
-    await state.finish()
 
 @dp.callback_query_handler(lambda c: c.data == "list_clones")
 async def list_clones(call: types.CallbackQuery):
@@ -2454,27 +2747,21 @@ async def list_clones(call: types.CallbackQuery):
         return
     
     bots = await get_clone_bots()
-    
     if not bots:
-        await call.answer("❌ No clone bots yet.", show_alert=True)
+        await call.answer("❌ No clone bots", show_alert=True)
         return
     
     text = "📋 **All Clone Bots**\n\n"
-    
     for bot in bots:
-        status = "✅ Running" if bot["token"] in clone_manager.clone_bots else "❌ Stopped"
-        text += f"**ID:** {bot['id']}\n"
-        text += f"**Bot:** @{bot['bot_username']}\n"
-        text += f"**Name:** {bot['bot_name']}\n"
-        text += f"**Status:** {status}\n"
-        text += f"**Users:** {bot['total_users']}\n"
-        text += f"**Created:** {bot['created_date'][:10]}\n"
-        text += "━━━━━━━━━━━━━━\n"
+        status = "✅" if bot["token"] in clone_manager.clone_bots else "❌"
+        text += f"{status} **@{bot['bot_username']}**\n"
+        text += f"   Owner: {bot['owner_name']}\n"
+        text += f"   Users: {bot['total_users']} | Searches: {bot['total_searches']}\n"
+        text += f"   Created: {bot['created_date'][:10]}\n\n"
     
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton("⬅ Back", callback_data="clone_bot_menu"))
     
-    # Split long message
     if len(text) > 4000:
         parts = [text[i:i+4000] for i in range(0, len(text), 4000)]
         for i, part in enumerate(parts):
@@ -2496,7 +2783,7 @@ async def clone_stats_all(call: types.CallbackQuery):
     total_searches = sum(bot.get("total_searches", 0) for bot in bots)
     running = len([b for b in bots if b["token"] in clone_manager.clone_bots])
     
-    text = "📊 **Clone Bot Statistics**\n\n"
+    text = "📊 **All Clone Bots Statistics**\n\n"
     text += f"🤖 **Total Bots:** {len(bots)}\n"
     text += f"✅ **Running:** {running}\n"
     text += f"❌ **Stopped:** {len(bots) - running}\n"
@@ -2504,7 +2791,7 @@ async def clone_stats_all(call: types.CallbackQuery):
     text += f"🔍 **Total Searches:** {total_searches}\n\n"
     
     if bots:
-        text += "**Top 5 Bots:**\n"
+        text += "**Top 5 Bots by Users:**\n"
         sorted_bots = sorted(bots, key=lambda x: x.get("total_users", 0), reverse=True)[:5]
         for i, bot in enumerate(sorted_bots, 1):
             text += f"{i}. @{bot['bot_username']} - {bot['total_users']} users\n"
@@ -2521,13 +2808,11 @@ async def manage_clones(call: types.CallbackQuery):
         return
     
     bots = await get_clone_bots()
-    
     if not bots:
-        await call.answer("❌ No clone bots.", show_alert=True)
+        await call.answer("❌ No clone bots", show_alert=True)
         return
     
     kb = InlineKeyboardMarkup(row_width=1)
-    
     for bot in bots:
         status = "🟢" if bot["token"] in clone_manager.clone_bots else "🔴"
         kb.add(InlineKeyboardButton(
@@ -2536,7 +2821,6 @@ async def manage_clones(call: types.CallbackQuery):
         ))
     
     kb.add(InlineKeyboardButton("⬅ Back", callback_data="clone_bot_menu"))
-    
     await call.message.edit_text("🛠 **Select Bot to Manage:**", reply_markup=kb)
 
 @dp.callback_query_handler(lambda c: c.data.startswith("manage_bot_"))
@@ -2548,20 +2832,19 @@ async def manage_single_bot(call: types.CallbackQuery):
     bot = await get_clone_bot(token)
     
     if not bot:
-        await call.answer("❌ Bot not found!", show_alert=True)
+        await call.answer("❌ Bot not found", show_alert=True)
         return
     
     status = "✅ Running" if token in clone_manager.clone_bots else "❌ Stopped"
     stats = await get_clone_bot_stats(token)
     
-    text = f"🤖 **Bot: @{bot['bot_username']}**\n\n"
-    text += f"**Name:** {bot['bot_name']}\n"
+    text = f"🤖 **@{bot['bot_username']}**\n\n"
+    text += f"**Owner:** {bot['owner_name']}\n"
     text += f"**Status:** {status}\n"
     text += f"**Users:** {bot['total_users']}\n"
     text += f"**Searches:** {bot['total_searches']}\n"
     text += f"**Daily Active:** {stats['daily_active'] if stats else 0}\n"
     text += f"**Created:** {bot['created_date'][:10]}\n"
-    text += f"**Token:** {token[:20]}...\n"
     
     kb = InlineKeyboardMarkup(row_width=2)
     
@@ -2571,7 +2854,6 @@ async def manage_single_bot(call: types.CallbackQuery):
         kb.add(InlineKeyboardButton("▶️ Start", callback_data=f"start_bot_{token}"))
     
     kb.add(InlineKeyboardButton("🗑 Delete", callback_data=f"delete_bot_{token}"))
-    kb.add(InlineKeyboardButton("📊 Details", callback_data=f"bot_details_{token}"))
     kb.add(InlineKeyboardButton("⬅ Back", callback_data="manage_clones"))
     
     await call.message.edit_text(text, reply_markup=kb)
@@ -2588,8 +2870,6 @@ async def start_bot(call: types.CallbackQuery):
         await clone_manager.start_bot(bot_info)
         await update_clone_bot(token, status="active")
         await call.answer("✅ Bot started!", show_alert=True)
-    else:
-        await call.answer("❌ Bot not found!", show_alert=True)
     
     await manage_single_bot(call)
 
@@ -2599,10 +2879,8 @@ async def stop_bot(call: types.CallbackQuery):
         return
     
     token = call.data.replace("stop_bot_", "")
-    
     await clone_manager.stop_bot(token)
     await call.answer("✅ Bot stopped!", show_alert=True)
-    
     await manage_single_bot(call)
 
 @dp.callback_query_handler(lambda c: c.data.startswith("delete_bot_"))
@@ -2619,7 +2897,7 @@ async def delete_bot_confirm(call: types.CallbackQuery):
     )
     
     await call.message.edit_text(
-        f"⚠️ **Are you sure you want to delete this bot?**\n\n"
+        f"⚠️ **Delete this bot?**\n\n"
         f"This will delete all user data permanently.",
         reply_markup=kb
     )
@@ -2630,57 +2908,27 @@ async def confirm_delete_bot(call: types.CallbackQuery):
         return
     
     token = call.data.replace("confirm_delete_", "")
-    
     await clone_manager.delete_bot(token)
     await call.answer("✅ Bot deleted!", show_alert=True)
-    
     await clone_bot_menu(call)
 
-@dp.callback_query_handler(lambda c: c.data.startswith("bot_details_"))
-async def bot_details(call: types.CallbackQuery):
-    if call.from_user.id != OWNER_ID:
-        return
-    
-    token = call.data.replace("bot_details_", "")
-    stats = await get_clone_bot_stats(token)
-    
-    if not stats:
-        await call.answer("❌ Stats not found!", show_alert=True)
-        return
-    
-    text = f"📊 **Detailed Stats for @{stats['bot_username']}**\n\n"
-    text += f"👥 **Total Users:** {stats['total_users']}\n"
-    text += f"📈 **Total Searches:** {stats['total_searches']}\n"
-    text += f"📊 **Daily Active:** {stats['daily_active']}\n"
-    text += f"📅 **Created:** {stats['created_date'][:10]}\n"
-    text += f"📌 **Status:** {stats['status']}\n"
-    text += f"🔑 **Token:** {stats['token']}\n"
-    
-    kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("⬅ Back", callback_data=f"manage_bot_{token}"))
-    
-    await call.message.edit_text(text, reply_markup=kb)
-
 # ==================== On Startup ====================
-async def load_clone_bots_on_startup():
-    await clone_manager.load_all_bots()
-    print(f"✅ Loaded {len(clone_manager.clone_bots)} clone bots")
-
 async def on_startup(dp):
-    # Ensure all JSON files exist
+    # Create JSON files if not exist
     for file in ["movies", "users", "ads", "settings", "force_channels", 
                  "custom_texts", "auto_delete", "start_buttons", "start_welcome", "clone_bots"]:
         if not os.path.exists(f"{DATA_DIR}/{file}.json"):
             save_json(file, [])
     
     await load_movies_cache()
-    await load_clone_bots_on_startup()
+    await clone_manager.load_all_bots()
     asyncio.create_task(batch_worker())
     
-    print("✅ Bot started with Clone System")
-    print(f"✅ Movies in cache: {len(MOVIES_DICT)}")
-    print(f"✅ Batch size: {BATCH_SIZE}")
-    print(f"✅ Clone bots: {len(clone_manager.clone_bots)}")
+    print("=" * 50)
+    print("✅ BOT STARTED WITH COMPLETE CLONE SYSTEM")
+    print(f"✅ Movies: {len(MOVIES_DICT)}")
+    print(f"✅ Clone Bots: {len(clone_manager.clone_bots)}")
+    print("=" * 50)
 
 if __name__ == "__main__":
     executor.start_polling(dp, on_startup=on_startup, skip_updates=True)
